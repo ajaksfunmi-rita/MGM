@@ -161,22 +161,28 @@ button[data-baseweb="tab"] {
 """, unsafe_allow_html=True)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  SESSION STATE
+#  SESSION STATE — FIXED
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def _init_state():
+def init_session_state():
+    """Initialize session state with safe defaults"""
     defaults = {
-        "secret_key":    "",
-        "event_name":    "Annual Event 2025",
-        "participants":  {},   # {id: {id,name,role,org,email}}
-        "checkins":      {},   # {id: {id,name,role,org,email,time,method}}
-        "generated_cards": [], # list of {pid, name, pdf_bytes}
+        "secret_key": "",
+        "event_name": "Annual Event 2025",
+        "participants": {},
+        "checkins": {},
+        "generated_cards": [],
         "last_scan_result": None,
     }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-_init_state()
+# Call this safely
+try:
+    init_session_state()
+except AttributeError:
+    # Fallback if st.session_state is not available
+    pass
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  HMAC HELPERS
@@ -198,807 +204,631 @@ def build_qr_payload(pid, name, email, event, secret):
     )
 
 def verify_qr_payload(qr_text: str) -> dict:
-    secret       = st.session_state.secret_key
-    participants = st.session_state.participants
+    secret = st.session_state.get("secret_key", "")
+    participants = st.session_state.get("participants", {})
     try:
         payload = json.loads(qr_text)
     except Exception:
         return {"ok": False, "reason": "Not a valid Checkgate QR code"}
 
-    pid   = payload.get("id",    "")
-    name  = payload.get("name",  "")
+    pid = payload.get("id", "")
+    name = payload.get("name", "")
     event = payload.get("event", "")
-    sig   = payload.get("sig",   "")
+    sig_reported = payload.get("sig", "")
 
-    if not all([pid, name, sig]):
-        return {"ok": False, "reason": "QR is missing required fields"}
     if not secret:
-        return {"ok": False, "reason": "No secret key set — go to ⚙ Settings"}
+        return {"ok": False, "reason": "Secret key not set — go to Settings"}
 
-    email = participants.get(pid, {}).get("email", "")
-    attempts = (
-        [json.dumps({"id":pid,"name":name,"email":email,"event":event}, separators=(",",":")),
-         json.dumps({"id":pid,"name":name,"email":"",   "event":event}, separators=(",",":"))]
-        if email else
-        [json.dumps({"id":pid,"name":name,"email":"",   "event":event}, separators=(",",":"))]
+    p = participants.get(pid)
+    if not p:
+        return {"ok": False, "reason": f"ID {pid} not in participant list"}
+
+    email = p.get("email", "")
+    sig_input = json.dumps(
+        {"id": pid, "name": name, "email": email, "event": event},
+        separators=(",", ":"), ensure_ascii=False
     )
-    for attempt in attempts:
-        if hmac_sign(secret, attempt)[:16] == sig:
-            p = participants.get(pid, {})
-            return {
-                "ok":    True,
-                "id":    pid,
-                "name":  p.get("name",  name),
-                "role":  p.get("role",  ""),
-                "org":   p.get("org",   ""),
-                "email": p.get("email", email),
-                "event": event,
-            }
-    return {"ok": False, "reason": "Signature mismatch — wrong key or tampered QR"}
+    sig_computed = hmac_sign(secret, sig_input)[:16]
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CHECK-IN LOGIC
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def do_checkin(result: dict, method: str = "qr"):
-    pid  = result["id"]
-    name = result["name"]
-    if pid in st.session_state.checkins:
-        return "duplicate"
-    entry = {
-        "id":     pid,
-        "name":   name,
-        "role":   result.get("role",  ""),
-        "org":    result.get("org",   ""),
-        "email":  result.get("email", ""),
-        "event":  result.get("event", st.session_state.event_name),
-        "time":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "method": method,
+    if sig_computed != sig_reported:
+        return {"ok": False, "reason": "QR code signature verification failed — tampering detected"}
+
+    return {
+        "ok": True,
+        "id": pid,
+        "name": name,
+        "role": p.get("role", ""),
+        "org": p.get("org", ""),
+        "email": email,
     }
-    st.session_state.checkins[pid] = entry
-    return "ok"
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  QR IMAGE GENERATOR
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def make_qr_image(data: str, size: int = 200) -> Image.Image:
-    qr = qrcode.QRCode(
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=10, border=1,
-    )
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="#16130f", back_color="white")
-    return img.resize((size, size), Image.LANCZOS)
+def parse_participants_csv(uploader):
+    """Parse CSV file and auto-detect column names"""
+    try:
+        df = pd.read_csv(uploader, dtype=str)
+    except Exception as e:
+        st.error(f"Could not parse CSV: {e}")
+        return [], {}
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PDF CARD GENERATOR
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-C_INK    = colors.HexColor("#16130f")
-C_GOLD   = colors.HexColor("#b8832a")
-C_GOLD2  = colors.HexColor("#d4a855")
-C_GOLD3  = colors.HexColor("#f0c97a")
-C_FOREST = colors.HexColor("#3d7259")
-C_PAPER  = colors.HexColor("#faf8f4")
-C_PAPER2 = colors.HexColor("#f0ebe0")
-C_INK3   = colors.HexColor("#8a7a6e")
+    col_map = {
+        "name": None,
+        "email": None,
+        "role": None,
+        "org": None,
+        "badge": None,
+    }
 
-CARD_W = 148 * mm
-CARD_H = 105 * mm
+    cols_lower = {c.lower().strip(): c for c in df.columns}
+    for key in col_map:
+        for variant in [key, f"{key}_*", f"*{key}", f"*{key}*"]:
+            if variant.replace("*", "") == key:
+                for col, col_l in cols_lower.items():
+                    if key in col.lower():
+                        col_map[key] = col_l
+                        break
+            if col_map[key]:
+                break
 
-def draw_pdf_card(c, participant: dict, event_name: str):
-    w, h = CARD_W, CARD_H
+    rows = df.to_dict("records")
+    return rows, col_map
 
-    # Background
-    c.setFillColor(colors.white)
-    c.roundRect(0, 0, w, h, radius=3*mm, fill=1, stroke=0)
-
-    # Gold accent bar
-    bw = 7
-    c.setFillColor(C_GOLD)
-    c.roundRect(0, 0, bw, h, radius=2*mm, fill=1, stroke=0)
-    c.rect(bw//2, 0, bw//2, h, fill=1, stroke=0)
-
-    # QR column background
-    qr_col_w = 42 * mm
-    qr_x = w - qr_col_w
-    c.setFillColor(C_PAPER)
-    c.rect(qr_x, 0, qr_col_w, h, fill=1, stroke=0)
-
-    # Separator
-    c.setStrokeColor(C_PAPER2)
-    c.setLineWidth(0.5)
-    c.line(qr_x, 3*mm, qr_x, h - 3*mm)
-
-    # Content area
-    mx = bw + 4*mm
-
-    # Event name
-    c.setFillColor(C_GOLD)
-    c.setFont("Helvetica", 6.5)
-    c.drawString(mx, h - 10*mm, event_name.upper())
-
-    # Name
-    name = participant.get("name", "")
-    font_sz = 20 if len(name) <= 20 else 16
-    c.setFillColor(C_INK)
-    c.setFont("Helvetica-Bold", font_sz)
-    y = h - 20*mm
-    for line in textwrap.wrap(name, 22)[:2]:
-        c.drawString(mx, y, line)
-        y -= font_sz + 3
-
-    # Role
-    role = participant.get("role", "")
-    if role:
-        c.setFillColor(C_FOREST)
-        c.setFont("Helvetica", 9)
-        c.drawString(mx, y - 2, role[:42])
-        y -= 13
-
-    # Org
-    org = participant.get("org", "")
-    if org:
-        c.setFillColor(C_INK3)
-        c.setFont("Helvetica", 8)
-        c.drawString(mx, y - 2, org[:44])
-
-    # Divider
-    c.setStrokeColor(C_GOLD)
-    c.setLineWidth(1.5)
-    c.line(mx, 12*mm, mx + 18*mm, 12*mm)
-
-    # Badge ID pill
-    pid = participant.get("id", "")
-    c.setFillColor(C_PAPER2)
-    c.roundRect(mx, 5*mm, 28*mm, 5.5*mm, radius=2*mm, fill=1, stroke=0)
-    c.setFillColor(C_INK3)
-    c.setFont("Helvetica", 7)
-    c.drawString(mx + 2*mm, 6.5*mm, f"ID · {pid}")
-
-    # QR code
-    qr_payload = participant.get("_qr_payload", "")
-    if qr_payload:
-        qr_img  = make_qr_image(qr_payload, size=180)
-        buf     = io.BytesIO()
-        qr_img.save(buf, format="PNG")
-        buf.seek(0)
-        qr_size = 32*mm
-        qr_cx   = qr_x + (qr_col_w - qr_size) / 2
-        qr_cy   = (h - qr_size) / 2 + 3*mm
-        pad     = 2*mm
-        c.setFillColor(colors.white)
-        c.roundRect(qr_cx - pad, qr_cy - pad, qr_size + 2*pad, qr_size + 2*pad,
-                    radius=2*mm, fill=1, stroke=0)
-        c.drawImage(ImageReader(buf), qr_cx, qr_cy, width=qr_size, height=qr_size)
-
-    # Scan label
-    c.setFillColor(C_INK3)
-    c.setFont("Helvetica", 6)
-    lbl = "SCAN TO CHECK IN"
-    lw  = c.stringWidth(lbl, "Helvetica", 6)
-    c.drawString(qr_x + (qr_col_w - lw) / 2, 6*mm, lbl)
-
-    # Corner glow
-    c.setFillColor(C_GOLD)
-    c.setFillAlpha(0.05)
-    c.circle(w, h, 20*mm, fill=1, stroke=0)
-    c.setFillAlpha(1.0)
-
-
-def generate_pdf_card(participant: dict, event_name: str) -> bytes:
+def generate_card_pdf(pid, name, email, role, org, photo_url, qr_pil, template_a4=True):
+    """Generate a single PDF card with QR code and participant details"""
     buf = io.BytesIO()
-    from reportlab.lib.pagesizes import landscape
-    c = rl_canvas.Canvas(buf, pagesize=landscape((CARD_W, CARD_H)))
-    draw_pdf_card(c, participant, event_name)
-    c.showPage()
+    if template_a4:
+        w, h = 210 * mm, 297 * mm
+    else:
+        w, h = 105 * mm, 148 * mm
+
+    c = rl_canvas.Canvas(buf, pagesize=(w, h))
+    c.setFont("Helvetica-Bold", 20)
+    c.drawString(15 * mm, h - 30 * mm, name)
+
+    if role:
+        c.setFont("Helvetica", 10)
+        c.drawString(15 * mm, h - 38 * mm, f"Role: {role}")
+    if org:
+        c.setFont("Helvetica", 10)
+        c.drawString(15 * mm, h - 45 * mm, f"Org: {org}")
+
+    qr_img = ImageReader(qr_pil)
+    qr_size = 40 * mm
+    c.drawImage(qr_img, w - qr_size - 10 * mm, h - qr_size - 20 * mm, width=qr_size, height=qr_size)
+
+    c.setFont("Helvetica", 8)
+    c.drawString(15 * mm, 20 * mm, f"ID: {pid}")
+
     c.save()
     buf.seek(0)
-    return buf.read()
+    return buf.getvalue()
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CSV PARSER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-AUTO_KEYS = {
-    "name":  ["name","full","participant","attendee"],
-    "email": ["email","mail"],
-    "role":  ["role","title","position","job"],
-    "org":   ["org","company","affil","institution","firm"],
-    "badge": ["badge","id","number","num","ref","ticket"],
-}
-
-def detect_col(headers, field):
-    for h in headers:
-        if any(k in h.lower() for k in AUTO_KEYS.get(field, [])):
-            return h
-    return None
-
-def parse_participants_csv(uploaded_file) -> tuple[list, dict]:
-    df = pd.read_csv(uploaded_file, dtype=str, keep_default_na=False)
-    hdrs   = list(df.columns)
-    colmap = {f: detect_col(hdrs, f) for f in AUTO_KEYS}
-    rows   = df.to_dict(orient="records")
-    return rows, colmap
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  EXPORT HELPERS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def export_checkins_csv() -> bytes:
-    checkins = list(st.session_state.checkins.values())
-    if not checkins:
-        return b""
-    headers = ["id","name","role","org","email","event","time","method"]
+def export_checkins_csv():
+    """Export checkins to CSV bytes"""
+    if not st.session_state.get("checkins"):
+        return None
     buf = io.StringIO()
-    w   = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
-    w.writeheader()
-    w.writerows(checkins)
+    writer = csv.DictWriter(buf, fieldnames=["id", "name", "role", "org", "email", "event", "time", "method"])
+    writer.writeheader()
+    for ci in st.session_state.checkins.values():
+        writer.writerow(ci)
     return buf.getvalue().encode()
 
-def export_participants_json() -> bytes:
-    return json.dumps({
-        "event":       st.session_state.event_name,
-        "generatedAt": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-        "participants": list(st.session_state.participants.values()),
-    }, indent=2, ensure_ascii=False).encode()
-
-def build_cards_zip() -> bytes:
-    cards = st.session_state.generated_cards
-    buf   = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for card in cards:
-            zf.writestr(f"cards/{card['pid']}-{card['name'].replace(' ','_')}.pdf", card["pdf_bytes"])
-        zf.writestr("participants.json", export_participants_json().decode())
-        zf.writestr("SETUP.txt", textwrap.dedent(f"""
-            CHECKGATE SETUP
-            ================
-            Event: {st.session_state.event_name}
-            Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
-            1. Print cards from the cards/ folder
-            2. Use the Scanner tab in this Streamlit app to check people in
-            3. Keep your secret key safe — never share it
-        """).strip())
-    buf.seek(0)
-    return buf.read()
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CAMERA QR SCANNER COMPONENT
-#  Pure HTML/JS injected into Streamlit via
-#  st.components.v1.html — uses jsQR library.
-#  When a valid QR is detected the JS posts the
-#  result to a hidden Streamlit text_input via
-#  the streamlit:setComponentValue protocol.
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SCANNER_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
-<style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: #0c0f0e; font-family: 'DM Sans', system-ui, sans-serif; color: #e4ece6; }
-#wrap {
-  display: flex; flex-direction: column; align-items: center;
-  padding: 16px; gap: 14px; min-height: 100vh;
-}
-#cam-box {
-  position: relative; width: 100%; max-width: 360px;
-  border-radius: 16px; overflow: hidden;
-  background: #1a2020;
-  box-shadow: 0 0 0 1px rgba(255,255,255,0.1), 0 8px 32px rgba(0,0,0,0.6);
-}
-#cam-box::before { content:''; display:block; padding-top:100%; }
-#video {
-  position:absolute; inset:0; width:100%; height:100%;
-  object-fit:cover; border-radius:16px;
-}
-#canvas-hidden { display:none; }
-.corners {
-  position:absolute; inset:0; pointer-events:none;
-  display:flex; align-items:center; justify-content:center;
-}
-.frame {
-  width:62%; aspect-ratio:1; position:relative;
-}
-.frame::before,.frame::after,.c3,.c4 {
-  content:''; position:absolute;
-  width:24px; height:24px;
-  border-color:#36d97e; border-style:solid; border-width:0;
-}
-.frame::before{top:0;left:0;border-top-width:3px;border-left-width:3px;border-radius:4px 0 0 0}
-.frame::after {top:0;right:0;border-top-width:3px;border-right-width:3px;border-radius:0 4px 0 0}
-.c3{bottom:0;left:0;border-bottom-width:3px;border-left-width:3px;border-radius:0 0 0 4px}
-.c4{bottom:0;right:0;border-bottom-width:3px;border-right-width:3px;border-radius:0 0 4px 0}
-.scan-line {
-  position:absolute; left:18%; right:18%; height:2px;
-  background:linear-gradient(90deg,transparent,#36d97e,transparent);
-  animation:scan 2s ease-in-out infinite; border-radius:1px;
-}
-@keyframes scan{0%{top:20%;opacity:0}10%{opacity:.7}90%{opacity:.7}100%{top:80%;opacity:0}}
-
-#status {
-  font-size:12px; color:#546860; text-align:center;
-  display:flex; align-items:center; gap:6px;
-}
-#dot {
-  width:8px; height:8px; border-radius:50%;
-  background:#546860; flex-shrink:0;
-}
-#dot.active { background:#36d97e; animation:pulse 1.2s infinite; }
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-
-#result-box {
-  width:100%; max-width:360px; border-radius:12px;
-  padding:14px 18px; display:none;
-  animation:pop .2s ease-out;
-}
-@keyframes pop{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-.res-ok  { background:#0d2b1a; border:1px solid #1e6b3e; display:flex!important; }
-.res-dup { background:#2b2200; border:1px solid #6b5000; display:flex!important; }
-.res-err { background:#2b0d0d; border:1px solid #6b1e1e; display:flex!important; }
-#result-box { align-items:center; gap:12px; }
-.res-icon { font-size:24px; flex-shrink:0; }
-.res-name { font-size:17px; font-weight:700; color:#faf8f4; }
-.res-sub  { font-size:12px; color:#9aada0; margin-top:3px; }
-.badge {
-  margin-left:auto; padding:3px 10px; border-radius:20px;
-  font-size:10px; font-weight:700; letter-spacing:.06em;
-  text-transform:uppercase; flex-shrink:0;
-}
-.badge-ok  { background:#36d97e; color:#06180c; }
-.badge-dup { background:#f0b020; color:#180f00; }
-.badge-err { background:#ff5f5f; color:#180606; }
-
-#start-btn {
-  padding:12px 32px; border-radius:10px; font-size:15px; font-weight:600;
-  background:#36d97e; color:#06180c; border:none; cursor:pointer;
-  width:100%; max-width:360px;
-  font-family:system-ui,sans-serif;
-  transition:background .15s;
-}
-#start-btn:hover { background:#4ee894; }
-
-.hint { font-size:11px; color:#546860; text-align:center; max-width:320px; line-height:1.6; }
-</style>
-</head>
-<body>
-<div id="wrap">
-  <div id="cam-box">
-    <video id="video" playsinline autoplay muted></video>
-    <canvas id="canvas-hidden"></canvas>
-    <div class="corners">
-      <div class="frame">
-        <div class="c3"></div><div class="c4"></div>
-        <div class="scan-line"></div>
-      </div>
-    </div>
-  </div>
-
-  <div id="status"><div id="dot"></div><span id="status-txt">Tap Start to activate camera</span></div>
-
-  <div id="result-box">
-    <div class="res-icon" id="res-icon"></div>
-    <div>
-      <div class="res-name" id="res-name"></div>
-      <div class="res-sub"  id="res-sub"></div>
-    </div>
-    <div class="badge" id="res-badge"></div>
-  </div>
-
-  <button id="start-btn" onclick="startCam()">▶ Start Camera</button>
-  <p class="hint">Point your phone's camera at a participant badge QR code.<br>Hold steady until it detects automatically.</p>
-</div>
-
-<script>
-let stream = null;
-let scanning = false;
-let cooldownUntil = 0;
-let flashTimer = null;
-
-function startCam() {
-  document.getElementById('start-btn').style.display = 'none';
-  const constraints = {
-    video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
-  };
-  navigator.mediaDevices.getUserMedia(constraints)
-    .then(s => {
-      stream = s;
-      const v = document.getElementById('video');
-      v.srcObject = stream;
-      v.onloadedmetadata = () => { v.play(); startScanning(); };
-    })
-    .catch(err => {
-      document.getElementById('status-txt').textContent = 'Camera denied: ' + err.message;
-      document.getElementById('start-btn').style.display = 'block';
-    });
-}
-
-function startScanning() {
-  scanning = true;
-  document.getElementById('dot').classList.add('active');
-  document.getElementById('status-txt').textContent = 'Scanning…';
-  requestAnimationFrame(scanFrame);
-}
-
-function scanFrame() {
-  if (!scanning) return;
-  const video  = document.getElementById('video');
-  const canvas = document.getElementById('canvas-hidden');
-  if (video.readyState < 2 || !video.videoWidth) {
-    requestAnimationFrame(scanFrame); return;
-  }
-  canvas.width  = video.videoWidth;
-  canvas.height = video.videoHeight;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(video, 0, 0);
-  const img  = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
-  if (code && code.data && Date.now() > cooldownUntil) {
-    handleQR(code.data);
-  }
-  requestAnimationFrame(scanFrame);
-}
-
-function handleQR(data) {
-  cooldownUntil = Date.now() + 3000;
-
-  // Send to Streamlit via query param mechanism
-  // We write to a hidden text area that Streamlit watches
-  const input = window.parent.document.querySelector('input[aria-label="__qr_result__"]');
-  if (input) {
-    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-    nativeInputValueSetter.call(input, data);
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-  }
-
-  // Also show local feedback immediately
-  try {
-    const p = JSON.parse(data);
-    if (p.id && p.name && p.sig) {
-      showLocalResult('ok', p.name, p.id, 'Verifying…', 'badge-ok');
-    } else {
-      showLocalResult('err', 'Unknown QR', '', 'Not a badge', 'badge-err');
-    }
-  } catch {
-    showLocalResult('err', 'Not a badge QR', '', data.slice(0,40), 'badge-err');
-  }
-}
-
-function showLocalResult(type, name, sub, badge, badgeClass) {
-  const box = document.getElementById('result-box');
-  box.className = 'res-' + type;
-  const icons = { ok:'✓', dup:'⚠', err:'✕' };
-  document.getElementById('res-icon').textContent  = icons[type] || '?';
-  document.getElementById('res-name').textContent  = name;
-  document.getElementById('res-sub').textContent   = sub;
-  const badgeEl = document.getElementById('res-badge');
-  badgeEl.textContent  = badge;
-  badgeEl.className    = 'badge ' + badgeClass;
-  clearTimeout(flashTimer);
-  flashTimer = setTimeout(() => { box.className = ''; box.style.display = 'none'; }, 5000);
-}
-</script>
-</body>
-</html>
-"""
+def do_checkin(p_info, method="qr"):
+    """Record a check-in"""
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    pid = p_info.get("id", "??")
+    if pid in st.session_state.checkins:
+        st.session_state.last_scan_result = {
+            "type": "duplicate",
+            "name": p_info.get("name", "Unknown"),
+            "sub": "Already checked in"
+        }
+    else:
+        st.session_state.checkins[pid] = {
+            "id": pid,
+            "name": p_info.get("name", ""),
+            "role": p_info.get("role", ""),
+            "org": p_info.get("org", ""),
+            "email": p_info.get("email", ""),
+            "event": st.session_state.get("event_name", ""),
+            "time": now,
+            "method": method,
+        }
+        st.session_state.last_scan_result = {
+            "type": "ok",
+            "name": p_info.get("name", "Unknown"),
+            "sub": f"{p_info.get('role', '')} • {p_info.get('org', '')}".strip(" •")
+        }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  RENDER HEADER
+#  MAIN UI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-checkin_count = len(st.session_state.checkins)
-total_count   = len(st.session_state.participants)
 
-st.markdown(f"""
+# Header
+st.markdown("""
 <div class="cg-header">
-  <div>
-    <div class="cg-logo">Check<em>gate</em></div>
-    <div class="cg-tagline">Event Check-In System</div>
-  </div>
-  <div style="display:flex;gap:12px;align-items:center;">
-    <div style="text-align:right;">
-      <div style="font-family:'DM Mono',monospace;font-size:22px;color:#36d97e;font-weight:500;">{checkin_count}</div>
-      <div style="font-size:10px;color:#546860;text-transform:uppercase;letter-spacing:.08em;">Checked in</div>
+    <div>
+        <div class="cg-logo">Check<em>gate</em></div>
+        <div class="cg-tagline">Event attendance management</div>
     </div>
-    <div style="width:1px;height:36px;background:rgba(255,255,255,0.1);"></div>
-    <div style="text-align:right;">
-      <div style="font-family:'DM Mono',monospace;font-size:22px;color:#e4ece6;font-weight:500;">{total_count or '–'}</div>
-      <div style="font-size:10px;color:#546860;text-transform:uppercase;letter-spacing:.08em;">Total</div>
-    </div>
-    <div class="cg-badge">HMAC-SHA256</div>
-  </div>
+    <div class="cg-badge">Ready</div>
 </div>
 """, unsafe_allow_html=True)
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TABS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-tab_gen, tab_scan, tab_attend, tab_settings = st.tabs([
-    "🎴  Card Generator",
-    "📷  Scanner",
-    "📋  Attendance",
-    "⚙  Settings",
-])
+# Tabs
+tab_gen, tab_scan, tab_attend, tab_settings = st.tabs(
+    ["🎴 Card Generator", "📷 Scanner", "📋 Attendance", "⚙ Settings"]
+)
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  TAB 1 — CARD GENERATOR
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 with tab_gen:
-    st.markdown("### Generate participant badge cards")
-    st.markdown("Upload your CSV → cards are generated with a permanent signed QR code. "
-                "The QR can never be forged without your secret key.")
+    st.markdown("### Generate signed participant badge cards")
+    st.markdown("Upload a CSV with participant data. Each person gets a static QR code signed with your secret key.")
 
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        event_input = st.text_input("Event name", value=st.session_state.event_name, key="gen_event")
-        st.session_state.event_name = event_input
-    with col_b:
-        key_input = st.text_input("Secret signing key", type="password",
-                                  value=st.session_state.secret_key,
-                                  placeholder="Enter a strong secret — same key goes in Scanner tab",
-                                  key="gen_key")
-        st.session_state.secret_key = key_input
+    col_csv, col_key = st.columns(2)
+    with col_csv:
+        csv_file = st.file_uploader("Upload CSV", type=["csv"], key="gen_csv")
+    with col_key:
+        secret = st.text_input("Secret key", type="password", placeholder="e.g., mysecret123", key="gen_key")
 
-    col_c, col_d = st.columns([1, 1])
-    with col_c:
-        id_prefix = st.text_input("Badge ID prefix", value="P", max_chars=4,
-                                  help="E.g. P → P0001, DEL → DEL0001")
-    with col_d:
-        id_start = st.number_input("Starting number", min_value=1, max_value=9999, value=1)
-
-    st.markdown("---")
-
-    uploaded_csv = st.file_uploader(
-        "Upload participants CSV",
-        type=["csv"],
-        help="Required columns: name. Optional: email, role, organisation, badge_id"
-    )
-
-    # Sample CSV download
-    sample_csv = ("name,email,role,organisation,badge_id\n"
-                  "Alice Martin,alice@example.com,Lead Engineer,Acumen Labs,\n"
-                  "Bob Chen,bob@example.com,Product Manager,Nexus Corp,\n"
-                  "Clara Osei,clara@example.com,UX Designer,Studio Volta,\n")
-    st.download_button("⬇ Download sample CSV template", sample_csv,
-                       file_name="participants-template.csv", mime="text/csv")
-
-    if uploaded_csv:
-        rows, colmap = parse_participants_csv(uploaded_csv)
-        st.success(f"✓ {len(rows)} participants loaded")
-
-        with st.expander("Preview CSV & column mapping"):
-            st.dataframe(pd.DataFrame(rows).head(5), use_container_width=True)
-            st.markdown("**Auto-detected column mapping:**")
-            mapping_df = pd.DataFrame([
-                {"Field": k, "Mapped to": v or "*(not found)*"} for k, v in colmap.items()
-            ])
-            st.dataframe(mapping_df, use_container_width=True, hide_index=True)
-
-        if not colmap["name"]:
-            st.error("Could not find a name column. Please check your CSV headers.")
-        elif not st.session_state.secret_key:
-            st.warning("⚠ Enter a secret key above before generating cards.")
+    if csv_file and secret:
+        rows, colmap = parse_participants_csv(csv_file)
+        if not colmap.get("name"):
+            st.error("CSV must have a 'name' column")
         else:
-            if st.button("⚡ Generate all cards", type="primary", use_container_width=True):
-                progress = st.progress(0, text="Generating cards…")
-                cards_out = []
-                participants_out = {}
+            st.success(f"✓ Found {len(rows)} participants")
 
-                for i, row in enumerate(rows):
-                    name  = (row.get(colmap["name"],  "") or "").strip()
-                    email = (row.get(colmap["email"], "") or "").strip() if colmap["email"] else ""
-                    role  = (row.get(colmap["role"],  "") or "").strip() if colmap["role"]  else ""
-                    org   = (row.get(colmap["org"],   "") or "").strip() if colmap["org"]   else ""
-                    if colmap["badge"] and row.get(colmap["badge"], "").strip():
-                        pid = row[colmap["badge"]].strip()
-                    else:
-                        pid = f"{id_prefix.upper()}{str(int(id_start)+i).zfill(4)}"
-                    if not name:
-                        continue
+            col_event, col_prefix, col_start = st.columns(3)
+            with col_event:
+                event = st.text_input("Event name", value=st.session_state.get("event_name", ""), key="gen_event")
+            with col_prefix:
+                prefix = st.text_input("Badge ID prefix", value="P", key="gen_prefix", max_chars=10)
+            with col_start:
+                start_num = st.number_input("Starting number", value=1, min_value=1, key="gen_start")
 
-                    qr_payload = build_qr_payload(pid, name, email, event_input,
-                                                  st.session_state.secret_key)
-                    participant = {"id": pid, "name": name, "email": email,
-                                   "role": role, "org": org, "_qr_payload": qr_payload}
-                    pdf_bytes   = generate_pdf_card(participant, event_input)
+            if st.button("Generate Cards", use_container_width=True, key="gen_btn"):
+                progress = st.progress(0)
+                status = st.status("Generating...", expanded=True)
 
-                    cards_out.append({"pid": pid, "name": name, "pdf_bytes": pdf_bytes})
-                    participants_out[pid] = {"id":pid,"name":name,"email":email,"role":role,"org":org}
+                cards_data = []
+                participants_list = []
 
-                    progress.progress((i+1)/len(rows),
-                                      text=f"Generated {i+1}/{len(rows)} — {name}")
+                for idx, row in enumerate(rows):
+                    name = row.get(colmap["name"], f"Participant {idx+1}")
+                    email = row.get(colmap.get("email"), "") if colmap.get("email") else ""
+                    role = row.get(colmap.get("role"), "") if colmap.get("role") else ""
+                    org = row.get(colmap.get("org"), "") if colmap.get("org") else ""
+                    photo_url = row.get(colmap.get("photo"), "") if colmap.get("photo") else ""
 
-                st.session_state.generated_cards = cards_out
-                st.session_state.participants     = participants_out
-                progress.empty()
-                st.success(f"✓ {len(cards_out)} cards generated and signed!")
+                    pid = f"{prefix}{str(idx + start_num).zfill(4)}"
+                    qr_payload = build_qr_payload(pid, name, email, event or "Event", secret)
 
-    # Download section
-    if st.session_state.generated_cards:
-        st.markdown("---")
-        st.markdown("#### Download cards")
+                    # Generate QR
+                    qr = qrcode.QRCode(version=1, box_size=10, border=2)
+                    qr.add_data(qr_payload)
+                    qr.make(fit=True)
+                    qr_pil = qr.make_image(fill_color="black", back_color="white")
 
-        col_dl1, col_dl2, col_dl3 = st.columns(3)
-        with col_dl1:
-            zip_bytes = build_cards_zip()
-            st.download_button(
-                "⬇ All cards + participants.json (ZIP)",
-                zip_bytes,
-                file_name=f"checkgate-cards-{datetime.now().strftime('%Y%m%d')}.zip",
-                mime="application/zip",
-                use_container_width=True,
-                type="primary",
-            )
-        with col_dl2:
-            st.download_button(
-                "⬇ participants.json",
-                export_participants_json(),
-                file_name="participants.json",
-                mime="application/json",
-                use_container_width=True,
-            )
+                    # Generate PDF
+                    pdf_bytes = generate_card_pdf(pid, name, email, role, org, photo_url, qr_pil)
 
-        st.markdown("---")
-        st.markdown("#### Card previews")
-        cols = st.columns(3)
-        for i, card in enumerate(st.session_state.generated_cards):
-            with cols[i % 3]:
+                    cards_data.append({"pid": pid, "name": name, "pdf": pdf_bytes})
+                    participants_list.append({
+                        "id": pid,
+                        "name": name,
+                        "email": email,
+                        "role": role,
+                        "org": org,
+                    })
+
+                    progress.progress((idx + 1) / len(rows))
+
+                # Save to session
+                st.session_state.generated_cards = cards_data
+                st.session_state.participants = {p["id"]: p for p in participants_list}
+
+                status.update(label=f"✓ Generated {len(cards_data)} cards", state="complete")
+                st.success("Cards ready for download!")
+
+                # Download individual PDFs
+                st.markdown("#### Individual PDFs")
+                cols = st.columns(3)
+                for i, card in enumerate(cards_data[:12]):
+                    with cols[i % 3]:
+                        st.download_button(
+                            label=f"📥 {card['name'][:15]}",
+                            data=card["pdf"],
+                            file_name=f"{card['pid']}-{card['name'].replace(' ', '_')}.pdf",
+                            mime="application/pdf",
+                            key=f"dl_{i}",
+                            use_container_width=True
+                        )
+
+                if len(cards_data) > 12:
+                    st.info(f"Showing first 12 of {len(cards_data)} cards. Scroll to see more.")
+
+                # ZIP download
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w") as zf:
+                    for card in cards_data:
+                        zf.writestr(f"{card['pid']}-{card['name'].replace(' ', '_')}.pdf", card["pdf"])
+                    zf.writestr("participants.json", json.dumps(participants_list, indent=2))
+
+                zip_buf.seek(0)
                 st.download_button(
-                    f"⬇ {card['pid']} — {card['name']}",
-                    card["pdf_bytes"],
-                    file_name=f"{card['pid']}-{card['name'].replace(' ','_')}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
+                    "📦 Download all as ZIP",
+                    zip_buf.getvalue(),
+                    file_name=f"cards-{datetime.now().strftime('%Y%m%d-%H%M')}.zip",
+                    mime="application/zip",
+                    use_container_width=True
                 )
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  TAB 2 — SCANNER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 with tab_scan:
-    if not st.session_state.secret_key:
-        st.markdown('<div class="warn-box">⚠ No secret key set. Go to the ⚙ Settings tab and enter your key first.</div>',
-                    unsafe_allow_html=True)
-    else:
-        st.markdown(f"**Event:** {st.session_state.event_name} &nbsp;·&nbsp; "
-                    f"**{len(st.session_state.checkins)}** checked in so far")
+    st.markdown("### 📷 Live QR Scanner")
+    st.markdown("**Choose your scanning method below:**")
 
-    st.markdown("---")
+    # Initialize QR scan result in session
+    if "scanned_qr" not in st.session_state:
+        st.session_state.scanned_qr = None
 
-    scan_col, manual_col = st.columns([1.2, 1])
+    scanner_mode = st.radio("Scanning Method", 
+                           ["📱 Phone Camera (Recommended)", "🔤 Manual ID Entry"],
+                           horizontal=True, label_visibility="collapsed")
 
-    with scan_col:
-        st.markdown("#### 📷 Phone camera scanner")
-        st.markdown(
-            '<div class="info-box">'
-            '📱 <strong>Open this page on your phone</strong> — tap Start Camera, '
-            'then point at a participant\'s badge QR code. '
-            'It detects automatically and the check-in is recorded instantly.'
-            '</div>',
-            unsafe_allow_html=True
+    if scanner_mode == "📱 Phone Camera (Recommended)":
+        st.markdown("#### 📱 Phone Camera Scanner")
+        st.markdown('<div class="info-box">✨ Tap "Start Scanner" and point your phone at the badge QR code. Works best in bright light.</div>', unsafe_allow_html=True)
+        
+        # HTML5 Camera Scanner with improved jsQR integration
+        camera_html = """
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+                    background: #0a0a0a; 
+                    color: #fff;
+                    padding: 0;
+                }
+                .scanner-container {
+                    max-width: 100%;
+                    margin: 0 auto;
+                    padding: 16px;
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    min-height: 100vh;
+                }
+                .scanner-box {
+                    position: relative;
+                    width: 100%;
+                    max-width: 400px;
+                    aspect-ratio: 1;
+                    background: #000;
+                    border-radius: 12px;
+                    overflow: hidden;
+                    border: 2px solid #36d97e;
+                    box-shadow: 0 0 20px rgba(54, 217, 126, 0.3);
+                }
+                #video {
+                    width: 100%;
+                    height: 100%;
+                    object-fit: cover;
+                    display: block;
+                }
+                #canvas { display: none; }
+                .scanner-overlay {
+                    position: absolute;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    width: 70%;
+                    height: 70%;
+                    border: 3px solid rgba(54, 217, 126, 0.5);
+                    border-radius: 12px;
+                    pointer-events: none;
+                    box-shadow: inset 0 0 0 9999px rgba(0, 0, 0, 0.3);
+                }
+                .scanner-corners {
+                    position: absolute;
+                    width: 40px;
+                    height: 40px;
+                    border: 3px solid #36d97e;
+                }
+                .corner-tl { top: 10%; left: 10%; border-right: none; border-bottom: none; border-radius: 8px 0 0 0; }
+                .corner-tr { top: 10%; right: 10%; border-left: none; border-bottom: none; border-radius: 0 8px 0 0; }
+                .corner-bl { bottom: 10%; left: 10%; border-right: none; border-top: none; border-radius: 0 0 0 8px; }
+                .corner-br { bottom: 10%; right: 10%; border-left: none; border-top: none; border-radius: 0 0 8px 0; }
+                .controls {
+                    margin-top: 20px;
+                    width: 100%;
+                    max-width: 400px;
+                    display: flex;
+                    gap: 10px;
+                    flex-wrap: wrap;
+                    justify-content: center;
+                }
+                button {
+                    flex: 1;
+                    min-width: 120px;
+                    padding: 12px 20px;
+                    font-size: 14px;
+                    font-weight: 600;
+                    border: none;
+                    border-radius: 8px;
+                    cursor: pointer;
+                    transition: all 0.3s;
+                    text-transform: uppercase;
+                    letter-spacing: 0.5px;
+                }
+                #startBtn {
+                    background: #36d97e;
+                    color: #000;
+                }
+                #startBtn:hover { background: #2eb66f; box-shadow: 0 4px 12px rgba(54, 217, 126, 0.4); }
+                #stopBtn {
+                    background: #ff5f5f;
+                    color: #fff;
+                }
+                #stopBtn:hover { background: #ff4444; }
+                #stopBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+                .status {
+                    margin-top: 16px;
+                    padding: 12px 16px;
+                    border-radius: 8px;
+                    font-size: 13px;
+                    text-align: center;
+                    min-height: 40px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }
+                .status-idle { background: rgba(96, 165, 250, 0.1); color: #60a5fa; }
+                .status-scanning { background: rgba(54, 217, 126, 0.1); color: #36d97e; animation: pulse 1.5s infinite; }
+                .status-success { background: rgba(54, 217, 126, 0.2); color: #36d97e; }
+                .status-error { background: rgba(255, 95, 95, 0.2); color: #ff5f5f; }
+                @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+                .hint { font-size: 12px; color: #888; margin-top: 12px; text-align: center; }
+            </style>
+        </head>
+        <body>
+            <div class="scanner-container">
+                <div class="scanner-box">
+                    <video id="video" playsinline></video>
+                    <canvas id="canvas"></canvas>
+                    <div class="scanner-overlay">
+                        <div class="scanner-corners corner-tl"></div>
+                        <div class="scanner-corners corner-tr"></div>
+                        <div class="scanner-corners corner-bl"></div>
+                        <div class="scanner-corners corner-br"></div>
+                    </div>
+                </div>
+                <div class="controls">
+                    <button id="startBtn" onclick="startCamera()">🎥 Start Scanner</button>
+                    <button id="stopBtn" onclick="stopCamera()" disabled>⏹️ Stop</button>
+                </div>
+                <div class="status status-idle" id="status">Ready to scan</div>
+                <div class="hint">📱 Allow camera access when prompted • Hold QR code in frame</div>
+            </div>
+
+            <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+            <script>
+                const video = document.getElementById('video');
+                const canvas = document.getElementById('canvas');
+                const statusDiv = document.getElementById('status');
+                const startBtn = document.getElementById('startBtn');
+                const stopBtn = document.getElementById('stopBtn');
+                
+                let ctx = canvas.getContext('2d', { willReadFrequently: true });
+                let scanning = false;
+                let lastScanned = null;
+
+                async function startCamera() {
+                    try {
+                        statusDiv.textContent = '📹 Requesting camera access...';
+                        statusDiv.className = 'status status-scanning';
+                        
+                        const stream = await navigator.mediaDevices.getUserMedia({
+                            video: {
+                                facingMode: 'environment',
+                                width: { ideal: 1280 },
+                                height: { ideal: 720 }
+                            },
+                            audio: false
+                        });
+                        
+                        video.srcObject = stream;
+                        video.setAttribute('playsinline', 'true');
+                        video.onloadedmetadata = () => {
+                            video.play().then(() => {
+                                scanning = true;
+                                startBtn.disabled = true;
+                                stopBtn.disabled = false;
+                                statusDiv.textContent = '✓ Scanning... Point at QR code';
+                                statusDiv.className = 'status status-scanning';
+                                scanFrame();
+                            });
+                        };
+                    } catch (err) {
+                        statusDiv.textContent = '❌ Camera access denied. Use manual entry below.';
+                        statusDiv.className = 'status status-error';
+                        console.error('Camera error:', err);
+                    }
+                }
+
+                function stopCamera() {
+                    scanning = false;
+                    startBtn.disabled = false;
+                    stopBtn.disabled = true;
+                    
+                    if (video.srcObject) {
+                        video.srcObject.getTracks().forEach(track => track.stop());
+                        video.srcObject = null;
+                    }
+                    statusDiv.textContent = 'Scanner stopped';
+                    statusDiv.className = 'status status-idle';
+                }
+
+                function scanFrame() {
+                    if (!scanning) return;
+
+                    try {
+                        if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                            canvas.width = video.videoWidth;
+                            canvas.height = video.videoHeight;
+                            
+                            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                            
+                            const code = jsQR(imageData.data, imageData.width, imageData.height, {
+                                inversionAttempts: 'dontInvert'
+                            });
+                            
+                            if (code) {
+                                const qrData = code.data;
+                                if (qrData !== lastScanned) {
+                                    lastScanned = qrData;
+                                    statusDiv.textContent = '✓ QR detected! Sending to app...';
+                                    statusDiv.className = 'status status-success';
+                                    
+                                    // Send data to Streamlit via postMessage
+                                    window.parent.postMessage({ 
+                                        type: 'streamlit:setComponentValue', 
+                                        value: qrData 
+                                    }, '*');
+                                    
+                                    stopCamera();
+                                    return;
+                                }
+                            }
+                        }
+                    } catch (err) {
+                        console.error('Scan error:', err);
+                    }
+
+                    requestAnimationFrame(scanFrame);
+                }
+
+                // Ensure we clean up on page unload
+                window.addEventListener('beforeunload', stopCamera);
+            </script>
+        </body>
+        </html>
+        """
+
+        # Display the scanner
+        try:
+            import streamlit.components.v1 as components
+            scanned_value = components.html(camera_html, height=700)
+            
+            # Process scanned QR code
+            if scanned_value:
+                st.session_state.scanned_qr = scanned_value
+                st.rerun()
+        except Exception as e:
+            st.warning(f"⚠️ Camera component unavailable: {e}")
+            st.info("Use the Manual ID Entry method below instead.")
+
+    else:  # Manual ID Entry mode
+        st.markdown("#### 🔤 Manual ID Entry")
+        st.markdown("Enter the participant ID directly (e.g., P0001)")
+        
+        manual_pid = st.text_input(
+            "Participant ID", 
+            placeholder="e.g., P0001", 
+            key="manual_pid_input",
+            label_visibility="collapsed"
         )
-        st.markdown("")
-
-        # Hidden text input that receives QR data from the JS component
-        qr_result = st.text_input("__qr_result__", label_visibility="hidden", key="qr_raw_input")
-
-        # Process incoming QR
-        if qr_result and qr_result != st.session_state.get("_last_processed_qr", ""):
-            st.session_state["_last_processed_qr"] = qr_result
-            result = verify_qr_payload(qr_result)
-            if result["ok"]:
-                status = do_checkin(result, method="qr-phone")
-                if status == "ok":
-                    st.session_state.last_scan_result = {
-                        "type": "ok",
-                        "name": result["name"],
-                        "sub":  " · ".join(filter(None, [result.get("role"), result.get("org")])) or result["id"],
-                    }
-                    st.rerun()
-                else:
-                    t = st.session_state.checkins[result["id"]]["time"]
-                    st.session_state.last_scan_result = {
-                        "type": "dup",
-                        "name": result["name"],
-                        "sub":  f"Already checked in at {t[11:16]}",
-                    }
-                    st.rerun()
-            else:
+        
+        if st.button("✓ Check in", use_container_width=True, key="manual_checkin_btn"):
+            if not manual_pid:
+                st.error("Please enter a participant ID")
+            elif manual_pid in st.session_state.get("participants", {}):
+                p = st.session_state.participants[manual_pid]
+                do_checkin(p, method="manual")
                 st.session_state.last_scan_result = {
-                    "type": "err", "name": "Invalid QR", "sub": result["reason"]
+                    "type": "ok",
+                    "name": p.get("name", "Unknown"),
+                    "sub": f"{p.get('role', '')} • {p.get('org', '')}".strip(" •")
                 }
                 st.rerun()
+            else:
+                st.error(f"❌ ID '{manual_pid}' not found in participant list")
+                st.session_state.last_scan_result = {
+                    "type": "error",
+                    "name": "Not Found",
+                    "sub": "ID not in participant database"
+                }
 
-        # Show last result
-        r = st.session_state.last_scan_result
-        if r:
-            icons  = {"ok": "✓", "dup": "⚠", "err": "✕"}
-            labels = {"ok": "CHECKED IN", "dup": "DUPLICATE", "err": "INVALID"}
-            chips  = {"ok": "chip-ok", "dup": "chip-dup", "err": "chip-err"}
+    st.markdown("---")
+    
+    # Result display
+    result = st.session_state.get("last_scan_result")
+    if result:
+        if result["type"] == "ok":
+            st.markdown(f'<div class="flash-ok"><div class="flash-name">✓ {result["name"]}</div>'
+                       f'<div class="flash-sub">Successfully checked in • {result["sub"]}</div></div>', 
+                       unsafe_allow_html=True)
+        elif result["type"] == "duplicate":
+            st.markdown(f'<div class="flash-dup"><div class="flash-name">⚠ {result["name"]}</div>'
+                       f'<div class="flash-sub">{result["sub"]}</div></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="flash-err"><div class="flash-name">✗ Error</div>'
+                       f'<div class="flash-sub">{result["sub"]}</div></div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("#### 🔢 Recent check-ins")
+    recent = sorted(st.session_state.get("checkins", {}).values(),
+                    key=lambda x: x["time"], reverse=True)[:10]
+    if recent:
+        for entry in recent:
             st.markdown(
-                f'<div class="flash-{r["type"]}">'
-                f'<div style="display:flex;align-items:center;justify-content:space-between;">'
-                f'<div class="flash-name">{icons[r["type"]]} {r["name"]}</div>'
-                f'<span class="{chips[r["type"]]}">{labels[r["type"]]}</span>'
-                f'</div>'
-                f'<div class="flash-sub">{r["sub"]}</div>'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                f'padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.06);">'
+                f'<div><span style="font-weight:600;color:#e4ece6;">{entry["name"]}</span>'
+                f'<br><span style="font-size:12px;color:#888;">{entry.get("role","") + " • " + entry.get("org","")}</span></div>'
+                f'<span style="font-family:monospace;font-size:12px;color:#36d97e;text-align:right;">{entry["time"][11:16]}<br>{entry.get("method","")}</span>'
                 f'</div>',
                 unsafe_allow_html=True
             )
-            st.markdown("")
+    else:
+        st.info("No check-ins yet. Start scanning QR codes or use manual entry.")
 
-        # Camera component
-        import streamlit.components.v1 as components
-        components.html(SCANNER_HTML, height=640, scrolling=False)
+    st.markdown("---")
+    st.markdown("#### 🔢 Recent check-ins")
+    recent = sorted(st.session_state.get("checkins", {}).values(),
+                    key=lambda x: x["time"], reverse=True)[:8]
+    if recent:
+        for entry in recent:
+            st.markdown(
+                f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                f'padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.06);">'
+                f'<div><span style="font-weight:500;color:#e4ece6;">{entry["name"]}</span>'
+                f'<span style="font-size:11px;color:#546860;margin-left:8px;">{entry.get("role","")}</span></div>'
+                f'<span style="font-family:monospace;font-size:11px;color:#36d97e;">{entry["time"][11:16]}</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+    else:
+        st.markdown('<div style="color:#546860;font-size:13px;">No check-ins yet</div>',
+                    unsafe_allow_html=True)
 
-    with manual_col:
-        st.markdown("#### ⌨ Manual check-in")
-        st.markdown("Use this as a backup — type a name or badge ID to check someone in.")
-
-        manual_query = st.text_input("Name or badge ID", placeholder="Alice Martin or P0001",
-                                     key="manual_query")
-
-        if st.button("Check in", use_container_width=True, type="primary"):
-            q = manual_query.strip()
-            if q:
-                # Find in participants
-                q_lo  = q.lower()
-                found = next(
-                    (p for p in st.session_state.participants.values()
-                     if p["id"].lower() == q_lo or q_lo in p["name"].lower()),
-                    None
-                )
-                if found:
-                    result = {**found, "event": st.session_state.event_name}
-                    status = do_checkin(result, method="manual")
-                    if status == "ok":
-                        st.session_state.last_scan_result = {
-                            "type": "ok",
-                            "name": found["name"],
-                            "sub":  " · ".join(filter(None, [found.get("role"), found.get("org")])) or found["id"],
-                        }
-                    else:
-                        t = st.session_state.checkins[found["id"]]["time"]
-                        st.session_state.last_scan_result = {
-                            "type": "dup", "name": found["name"],
-                            "sub": f"Already checked in at {t[11:16]}"
-                        }
-                    st.rerun()
-                else:
-                    # Walk-in
-                    pid = f"W-{int(datetime.now().timestamp())}"
-                    do_checkin({"id": pid, "name": q, "event": st.session_state.event_name,
-                                "role": "", "org": "", "email": ""}, method="walk-in")
-                    st.session_state.last_scan_result = {
-                        "type": "ok", "name": q, "sub": "Walk-in registered"
-                    }
-                    st.rerun()
-
-        st.markdown("---")
-        st.markdown("#### 🔢 Recent check-ins")
-        recent = sorted(st.session_state.checkins.values(),
-                        key=lambda x: x["time"], reverse=True)[:8]
-        if recent:
-            for entry in recent:
-                st.markdown(
-                    f'<div style="display:flex;justify-content:space-between;align-items:center;'
-                    f'padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.06);">'
-                    f'<div><span style="font-weight:500;color:#e4ece6;">{entry["name"]}</span>'
-                    f'<span style="font-size:11px;color:#546860;margin-left:8px;">{entry.get("role","")}</span></div>'
-                    f'<span style="font-family:monospace;font-size:11px;color:#36d97e;">{entry["time"][11:16]}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-        else:
-            st.markdown('<div style="color:#546860;font-size:13px;">No check-ins yet</div>',
-                        unsafe_allow_html=True)
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  TAB 3 — ATTENDANCE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 with tab_attend:
-    inn   = len(st.session_state.checkins)
-    total = len(st.session_state.participants)
-    pend  = max(total - inn, 0)
-    pct   = f"{inn*100//total}%" if total else "–"
+    inn = len(st.session_state.get("checkins", {}))
+    total = len(st.session_state.get("participants", {}))
+    pend = max(total - inn, 0)
+    pct = f"{inn*100//total}%" if total else "–"
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -1027,8 +857,8 @@ with tab_attend:
 
     # Build rows
     all_rows = []
-    for p in st.session_state.participants.values():
-        ci = st.session_state.checkins.get(p["id"])
+    for p in st.session_state.get("participants", {}).values():
+        ci = st.session_state.get("checkins", {}).get(p["id"])
         all_rows.append({
             "Status":   "✓ In" if ci else "Pending",
             "ID":       p["id"],
@@ -1039,8 +869,8 @@ with tab_attend:
             "Method":   ci.get("method","") if ci else "",
         })
 
-    for pid, ci in st.session_state.checkins.items():
-        if pid not in st.session_state.participants:
+    for pid, ci in st.session_state.get("checkins", {}).items():
+        if pid not in st.session_state.get("participants", {}):
             all_rows.append({
                 "Status": "✓ In", "ID": pid, "Name": ci["name"],
                 "Role": ci.get("role",""), "Org": ci.get("org",""),
@@ -1087,9 +917,9 @@ with tab_attend:
         )
     with col_exp2:
         json_export = json.dumps({
-            "event": st.session_state.event_name,
+            "event": st.session_state.get("event_name", ""),
             "exportedAt": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "checkins": list(st.session_state.checkins.values()),
+            "checkins": list(st.session_state.get("checkins", {}).values()),
         }, indent=2).encode()
         st.download_button(
             "⬇ Export JSON log",
@@ -1103,20 +933,20 @@ with tab_attend:
             st.session_state.checkins = {}
             st.rerun()
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  TAB 4 — SETTINGS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 with tab_settings:
     st.markdown("### Settings")
 
     col_s1, col_s2 = st.columns(2)
     with col_s1:
-        new_event = st.text_input("Event name", value=st.session_state.event_name, key="s_event")
+        new_event = st.text_input("Event name", value=st.session_state.get("event_name", ""), key="s_event")
         st.session_state.event_name = new_event
 
         new_key = st.text_input(
             "Secret signing key", type="password",
-            value=st.session_state.secret_key,
+            value=st.session_state.get("secret_key", ""),
             placeholder="Must match the key used in card generator",
             key="s_key",
             help="This key is stored in session only — never sent to any server."
@@ -1132,7 +962,7 @@ with tab_settings:
         imp_json = st.file_uploader("participants.json", type=["json"], key="imp_json")
         if imp_json:
             try:
-                data  = json.load(imp_json)
+                data = json.load(imp_json)
                 items = data if isinstance(data, list) else data.get("participants", [])
                 st.session_state.participants = {
                     p.get("id","??"): {
